@@ -82,6 +82,8 @@ pub enum Event {
         ty: DataType,
         /// Payload, represented as bytes.
         data: Box<[u8]>,
+        /// RSV bit
+        rsv: u8,
     },
 
     /// A Ping frame may serve either as a keepalive or as a means to verify that the remote endpoint is still responsive.

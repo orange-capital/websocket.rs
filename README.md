@@ -27,7 +27,7 @@ where
         ws.send("Copy Cat!").await?;
 
         match ws.recv_event().await? {
-            Event::Data { ty, data } => {
+            Event::Data { ty, data, rsv} => {
                 assert!(matches!(ty, DataType::Complete(MessageType::Text)));
                 assert_eq!(&*data, b"Copy Cat!");
             }

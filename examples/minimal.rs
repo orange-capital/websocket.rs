@@ -16,7 +16,7 @@ where
     for _ in 0..3 {
         ws.send("Copy Cat!").await?;
         match ws.recv().await? {
-            Event::Data { ty, data } => {
+            Event::Data { ty, data, rsv: _} => {
                 assert!(matches!(ty, DataType::Complete(MessageType::Text)));
                 assert_eq!(&*data, b"Copy Cat!");
             }

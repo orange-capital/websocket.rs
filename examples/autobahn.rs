@@ -57,7 +57,7 @@ where
     let mut buf = Vec::with_capacity(4096);
     loop {
         match ws.recv_event().await? {
-            Event::Data { ty, data } => match ty {
+            Event::Data { ty, data , rsv: _} => match ty {
                 DataType::Complete(ty) => send_msg(&mut ws, ty, &data).await?,
                 DataType::Stream(stream) => {
                     buf.extend_from_slice(&data);

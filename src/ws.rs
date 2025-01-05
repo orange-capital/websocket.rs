@@ -191,7 +191,7 @@ where
         let [b1, b2] = read_buf(&mut self.stream).await?;
 
         let fin = b1 & 0b_1000_0000 != 0;
-        let rsv = b1 & 0b_111_0000;
+        let rsv = (b1 & 0b_111_0000) >> 4;
         let opcode = b1 & 0b_1111;
         let len = (b2 & 0b_111_1111) as usize;
 
@@ -200,14 +200,6 @@ where
         // the "Payload data" as per [Section 5.3](https://datatracker.ietf.org/doc/html/rfc6455#section-5.3).  All frames sent from
         // client to server have this bit set to 1.
         let is_masked = b2 & 0b_1000_0000 != 0;
-
-        if rsv != 0 {
-            // MUST be `0` unless an extension is negotiated that defines meanings
-            // for non-zero values.  If a nonzero value is received and none of
-            // the negotiated extensions defines the meaning of such a nonzero
-            // value, the receiving endpoint MUST _Fail the WebSocket Connection_.
-            err!("reserve bit must be `0`");
-        }
 
         // A client MUST mask all frames that it sends to the server. (Note
         // that masking is done whether or not the WebSocket Protocol is running
@@ -267,7 +259,7 @@ where
                 err!("payload too large");
             }
             let data = self.read_payload(len).await?;
-            Ok(Event::Data { ty, data })
+            Ok(Event::Data { ty, data , rsv})
         }
     }
 

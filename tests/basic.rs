@@ -26,6 +26,7 @@ async fn unmasked() -> io::Result<()> {
     let mut ws = WebSocket::server(&mut writer);
     ws.send(Frame {
         fin: false,
+        rsv: 0,
         opcode: MessageType::Text as u8,
         data: b"Hel",
     })
@@ -33,6 +34,7 @@ async fn unmasked() -> io::Result<()> {
 
     ws.send(Frame {
         fin: true,
+        rsv: 0,
         opcode: 0,
         data: b"lo",
     })

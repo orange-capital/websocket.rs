@@ -2,6 +2,7 @@
 
 pub struct Frame<'a> {
     pub fin: bool,
+    pub rsv: u8,
     pub opcode: u8,
     pub data: &'a [u8],
 }
@@ -47,7 +48,7 @@ impl<'a> Frame<'a> {
     ///
     /// - `dist` must be valid for writes of 10 bytes.
     pub(crate) unsafe fn encode_header_unchecked(&self, dist: *mut u8, mask_bit: u8) -> usize {
-        dist.write(((self.fin as u8) << 7) | self.opcode);
+        dist.write(((self.fin as u8) << 7) | (self.rsv << 4) | self.opcode);
         if self.data.len() < 126 {
             dist.add(1).write(mask_bit | self.data.len() as u8);
             2
@@ -78,6 +79,7 @@ impl<'a> From<&'a str> for Frame<'a> {
     fn from(string: &'a str) -> Self {
         Self {
             fin: true,
+            rsv: 0,
             opcode: 1,
             data: string.as_bytes(),
         }
@@ -89,6 +91,7 @@ impl<'a> From<&'a [u8]> for Frame<'a> {
     fn from(data: &'a [u8]) -> Self {
         Self {
             fin: true,
+            rsv: 0,
             opcode: 2,
             data,
         }

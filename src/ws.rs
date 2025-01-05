@@ -79,6 +79,7 @@ where
     {
         self.send_raw(Frame {
             fin: true,
+            rsv: 0,
             opcode: 8,
             data: reason.to_bytes().as_ref(),
         })
@@ -103,6 +104,7 @@ where
     pub async fn send_ping(&mut self, data: impl AsRef<[u8]>) -> Result<()> {
         self.send_raw(Frame {
             fin: true,
+            rsv: 0,
             opcode: 9,
             data: data.as_ref(),
         })
@@ -116,6 +118,7 @@ where
     pub async fn send_pong(&mut self, data: impl AsRef<[u8]>) -> Result<()> {
         self.send_raw(Frame {
             fin: true,
+            rsv: 0,
             opcode: 10,
             data: data.as_ref(),
         })

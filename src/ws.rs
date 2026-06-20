@@ -372,19 +372,17 @@ where
     }
 
     async fn read_payload(&mut self, len: usize) -> Result<Box<[u8]>> {
+        // A server reads the 4-byte masking key that precedes the payload.
+        let mask: Option<[u8; 4]> = match self.role {
+            Role::Server => Some(read_buf(&mut self.stream).await?),
+            Role::Client => None,
+        };
+
         let mut data = vec![0; len].into_boxed_slice();
-        match self.role {
-            Role::Server => {
-                let mask: [u8; 4] = read_buf(&mut self.stream).await?;
-                self.stream.read_exact(&mut data).await?;
-                // TODO: Use SIMD wherever possible for best performance
-                for i in 0..data.len() {
-                    data[i] ^= mask[i & 3];
-                }
-            }
-            Role::Client => {
-                self.stream.read_exact(&mut data).await?;
-            }
+        self.stream.read_exact(&mut data).await?;
+
+        if let Some(mask) = mask {
+            crate::frame::apply_mask(&mut data, mask);
         }
         Ok(data)
     }
@@ -427,6 +425,22 @@ fn on_close(msg: &[u8]) -> Event {
             }
         }
         _ => Event::Error("invalid close code"),
+    }
+}
+
+impl<IO> From<(IO, Role)> for WebSocket<IO> {
+    #[inline]
+    fn from((stream, role): (IO, Role)) -> Self {
+        Self {
+            stream,
+            max_payload_len: 16 * 1024 * 1024,
+            allowed_rsv: 0,
+            role,
+            is_closed: false,
+            fragment: None,
+            msg_buf: Vec::new(),
+            msg_rsv: 0,
+        }
     }
 }
 
@@ -535,6 +549,26 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn client_mask_server_unmask_roundtrip() {
+        // 1000 bytes exercises the 16-bit extended length plus many full
+        // 8-byte mask chunks and a non-empty remainder, on both encode/decode.
+        let payload: Vec<u8> = (0..1000).map(|i| i as u8).collect();
+
+        let mut client = WebSocket::client(Vec::new());
+        client.send(&payload[..]).await.unwrap(); // masked binary frame
+        let wire = client.stream;
+
+        let mut server = WebSocket::server(&wire[..]);
+        match server.recv_event().await.unwrap() {
+            Event::Data { ty, data, .. } => {
+                assert!(matches!(ty, DataType::Complete(MessageType::Binary)));
+                assert_eq!(&*data, &payload[..]);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
     async fn rejects_reserved_bit_by_default() {
         // RSV1 set, but no extension negotiated (allowed_rsv defaults to 0).
         let bytes = frame(true, 0b100, 1, b"hi");
@@ -565,22 +599,6 @@ mod tests {
         match ws.recv_event().await.unwrap() {
             Event::Error(msg) => assert_eq!(msg, "reserve bit must be `0`"),
             other => panic!("expected error, got: {other:?}"),
-        }
-    }
-}
-
-impl<IO> From<(IO, Role)> for WebSocket<IO> {
-    #[inline]
-    fn from((stream, role): (IO, Role)) -> Self {
-        Self {
-            stream,
-            max_payload_len: 16 * 1024 * 1024,
-            allowed_rsv: 0,
-            role,
-            is_closed: false,
-            fragment: None,
-            msg_buf: Vec::new(),
-            msg_rsv: 0,
         }
     }
 }

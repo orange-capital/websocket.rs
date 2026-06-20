@@ -22,7 +22,8 @@ impl<'a> Frame<'a> {
 
     #[inline]
     pub fn encode_with(self, mask: [u8; 4]) -> Vec<u8> {
-        let mut buf = Vec::<u8>::with_capacity(14 + self.data.len());
+        let data_len = self.data.len();
+        let mut buf = Vec::<u8>::with_capacity(14 + data_len);
         unsafe {
             let dist = buf.as_mut_ptr();
             let head_len = self.encode_header_unchecked(dist, 0x80);
@@ -33,14 +34,12 @@ impl<'a> Frame<'a> {
             dist.add(head_len + 2).write(c);
             dist.add(head_len + 3).write(d);
 
-            let dist = dist.add(head_len + 4);
-            // TODO: Use SIMD wherever possible for best performance
-            for i in 0..self.data.len() {
-                dist.add(i)
-                    .write(self.data.get_unchecked(i) ^ mask.get_unchecked(i & 3));
-            }
-            buf.set_len(head_len + 4 + self.data.len());
+            std::ptr::copy_nonoverlapping(self.data.as_ptr(), dist.add(head_len + 4), data_len);
+            buf.set_len(head_len + 4 + data_len);
         }
+        // Mask the payload in place, word-at-a-time (see `apply_mask`).
+        let payload_start = buf.len() - data_len;
+        apply_mask(&mut buf[payload_start..], mask);
         buf
     }
 
@@ -94,6 +93,59 @@ impl<'a> From<&'a [u8]> for Frame<'a> {
             rsv: 0,
             opcode: 2,
             data,
+        }
+    }
+}
+
+/// XOR `data` in place with the repeating 4-byte WebSocket `mask`, applied from
+/// `data[0]` (i.e. `data[i] ^= mask[i % 4]`).
+///
+/// Used both to mask outgoing client payloads and to unmask incoming server
+/// payloads. It processes 8 bytes per iteration against a repeated mask word so
+/// the loop auto-vectorizes, rather than the scalar `i & 3` indexing that
+/// prevents it. Because each 8-byte step is a multiple of the 4-byte mask
+/// period, the mask stays aligned and the remainder resumes at `mask[i & 3]`.
+#[inline]
+pub(crate) fn apply_mask(data: &mut [u8], mask: [u8; 4]) {
+    let [a, b, c, d] = mask;
+    let mask_word = u64::from_ne_bytes([a, b, c, d, a, b, c, d]);
+    let mut chunks = data.chunks_exact_mut(8);
+    for chunk in &mut chunks {
+        let word = u64::from_ne_bytes(<[u8; 8]>::try_from(&chunk[..]).unwrap()) ^ mask_word;
+        chunk.copy_from_slice(&word.to_ne_bytes());
+    }
+    for (i, byte) in chunks.into_remainder().iter_mut().enumerate() {
+        *byte ^= mask[i & 3];
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::apply_mask;
+
+    /// The straightforward byte-at-a-time reference implementation.
+    fn naive(data: &mut [u8], mask: [u8; 4]) {
+        for (i, byte) in data.iter_mut().enumerate() {
+            *byte ^= mask[i & 3];
+        }
+    }
+
+    #[test]
+    fn apply_mask_matches_naive_and_is_involutive() {
+        let mask = [0xAB, 0x12, 0xCD, 0x34];
+        // Cover every remainder (0..=7) across several full 8-byte chunks.
+        for len in 0..40usize {
+            let original: Vec<u8> = (0..len).map(|i| i as u8).collect();
+            let mut fast = original.clone();
+            let mut reference = original.clone();
+
+            apply_mask(&mut fast, mask);
+            naive(&mut reference, mask);
+            assert_eq!(fast, reference, "masking mismatch at len {len}");
+
+            // Masking twice with the same key restores the original.
+            apply_mask(&mut fast, mask);
+            assert_eq!(fast, original, "masking not involutive at len {len}");
         }
     }
 }

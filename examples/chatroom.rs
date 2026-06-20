@@ -138,7 +138,9 @@ where
     R: AsyncRead + Send + Unpin + 'static,
 {
     cmd.send(Command::Send(format!("New User: {addr}").into()))?;
-    while let Ok(ev) = ws.recv().await {
+    // `recv_message` reassembles fragmented frames, so `Event::Data` here is
+    // always a `DataType::Complete` message we can parse as a single command.
+    while let Ok(ev) = ws.recv_message().await {
         match ev {
             Event::Data { data, .. } => {
                 let (kind, data) = str::from_utf8(&data)?.split_once(":").unwrap_or_default();

@@ -14,9 +14,27 @@ pub struct WebSocket<Stream> {
     /// Default: 16 MB
     pub max_payload_len: usize,
 
+    /// Bitmask of `rsv` bits permitted by a negotiated extension, as the 3-bit
+    /// value `0..=7` (RSV1 = `0b100`, RSV2 = `0b010`, RSV3 = `0b001`).
+    ///
+    /// Per [RFC 6455 §5.2](https://datatracker.ietf.org/doc/html/rfc6455#section-5.2),
+    /// a frame whose `rsv` sets any bit outside this mask fails the connection
+    /// with [`Event::Error`]. Since this crate does not negotiate extensions,
+    /// the default is `0` (all reserved bits must be zero). Set it to `0b100`
+    /// (RSV1) when [`permessage-deflate`](https://datatracker.ietf.org/doc/html/rfc7692)
+    /// has been negotiated.
+    ///
+    /// Default: 0
+    pub allowed_rsv: u8,
+
     role: Role,
     is_closed: bool,
     fragment: Option<MessageType>,
+
+    /// Accumulates the payload of a fragmented message across `recv_message` calls.
+    msg_buf: Vec<u8>,
+    /// `rsv` bits captured from the first (`Stream::Start`) fragment.
+    msg_rsv: u8,
 }
 
 impl<IO> WebSocket<IO> {
@@ -164,6 +182,87 @@ where
         event
     }
 
+    /// Like [`recv`](Self::recv), but reassembles a fragmented message into a
+    /// single complete one before returning it.
+    ///
+    /// Each call to [`recv`](Self::recv) yields one frame at a time, so a
+    /// fragmented message is observed as a sequence of
+    /// [`DataType::Stream`] events ([`Start`](Stream::Start),
+    /// [`Next`](Stream::Next), [`End`](Stream::End)). This method drives that
+    /// loop for you: the [`Event::Data`] it returns is always a
+    /// [`DataType::Complete`] holding the concatenated payload, with the `rsv`
+    /// bits taken from the first fragment.
+    ///
+    /// Per [RFC 6455 §5.4](https://datatracker.ietf.org/doc/html/rfc6455#section-5.4),
+    /// control frames (`Ping`/`Pong`/`Close`) may be interleaved between the
+    /// fragments of a data message. Those — and [`Event::Error`] — are returned
+    /// immediately; the partial payload is buffered and a later call resumes the
+    /// reassembly. The caller must still handle those events (e.g. answer a
+    /// `Ping` with [`send_pong`](Self::send_pong)).
+    ///
+    /// A reassembled payload exceeding [`max_payload_len`](Self::max_payload_len)
+    /// yields [`Event::Error`].
+    ///
+    /// ### Example
+    ///
+    /// ```no_run
+    /// # use web_socket::*;
+    /// # use tokio::io::{AsyncRead, AsyncWrite};
+    /// # async fn example<IO: Unpin + AsyncRead + AsyncWrite>(mut ws: WebSocket<IO>) -> std::io::Result<()> {
+    /// match ws.recv_message().await? {
+    ///     Event::Data { ty: DataType::Complete(_), data, .. } => { let _ = data; }
+    ///     Event::Ping(data) => ws.send_pong(data).await?,
+    ///     _ => {}
+    /// }
+    /// # Ok(()) }
+    /// ```
+    pub async fn recv_message(&mut self) -> Result<Event> {
+        loop {
+            let stream = match self.recv().await? {
+                Event::Data {
+                    ty: DataType::Complete(ty),
+                    data,
+                    rsv,
+                } if self.msg_buf.is_empty() => {
+                    // Fast path: an unfragmented message with nothing buffered.
+                    return Ok(Event::Data {
+                        ty: DataType::Complete(ty),
+                        data,
+                        rsv,
+                    });
+                }
+                Event::Data {
+                    ty: DataType::Stream(stream),
+                    data,
+                    rsv,
+                } => {
+                    if let Stream::Start(..) = stream {
+                        self.msg_rsv = rsv;
+                    }
+                    self.msg_buf.extend_from_slice(&data);
+                    stream
+                }
+                // Interleaved control frames (and errors) pass straight through;
+                // any buffered fragments are kept for the next call.
+                other => return Ok(other),
+            };
+
+            if self.msg_buf.len() > self.max_payload_len {
+                self.msg_buf = Vec::new();
+                self.is_closed = true;
+                return Ok(Event::Error("fragmented message too large"));
+            }
+            if let Stream::End(ty) = stream {
+                let data = std::mem::take(&mut self.msg_buf).into_boxed_slice();
+                return Ok(Event::Data {
+                    ty: DataType::Complete(ty),
+                    data,
+                    rsv: self.msg_rsv,
+                });
+            }
+        }
+    }
+
     // ### WebSocket Frame Header
     //
     // ```txt
@@ -194,6 +293,15 @@ where
         let rsv = (b1 & 0b_111_0000) >> 4;
         let opcode = b1 & 0b_1111;
         let len = (b2 & 0b_111_1111) as usize;
+
+        // Reserved bits MUST be `0` unless an extension is negotiated that
+        // defines meanings for non-zero values.  If a nonzero value is received
+        // and none of the negotiated extensions (see `allowed_rsv`) defines the
+        // meaning of such a nonzero value, the receiving endpoint MUST _Fail the
+        // WebSocket Connection_.
+        if rsv & !self.allowed_rsv != 0 {
+            err!("reserve bit must be `0`");
+        }
 
         // Defines whether the "Payload data" is masked.  If set to 1, a
         // masking key is present in masking-key, and this is used to unmask
@@ -322,15 +430,157 @@ fn on_close(msg: &[u8]) -> Event {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use crate::*;
+
+    /// Build a single raw, unmasked frame (server -> client direction) so it
+    /// can be read by a `WebSocket::client`. Only small payloads (< 126 bytes)
+    /// are supported, which keeps the length encoding a single byte.
+    fn frame(fin: bool, rsv: u8, opcode: u8, payload: &[u8]) -> Vec<u8> {
+        assert!(payload.len() < 126, "test helper only supports small payloads");
+        let b1 = ((fin as u8) << 7) | (rsv << 4) | opcode;
+        let b2 = payload.len() as u8; // top (mask) bit clear => unmasked
+        let mut buf = vec![b1, b2];
+        buf.extend_from_slice(payload);
+        buf
+    }
+
+    #[tokio::test]
+    async fn reassembles_fragmented_text() {
+        let mut bytes = Vec::new();
+        bytes.extend(frame(false, 0, 1, b"Hel")); // Start(Text)
+        bytes.extend(frame(false, 0, 0, b"lo")); // Next
+        bytes.extend(frame(true, 0, 0, b"!")); // End
+        let mut ws = WebSocket::client(&bytes[..]);
+
+        match ws.recv_message().await.unwrap() {
+            Event::Data { ty, data, rsv } => {
+                assert!(matches!(ty, DataType::Complete(MessageType::Text)));
+                assert_eq!(&*data, b"Hello!");
+                assert_eq!(rsv, 0);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn passes_complete_message_through() {
+        let bytes = frame(true, 0, 1, b"hi");
+        let mut ws = WebSocket::client(&bytes[..]);
+
+        match ws.recv_message().await.unwrap() {
+            Event::Data { ty, data, .. } => {
+                assert!(matches!(ty, DataType::Complete(MessageType::Text)));
+                assert_eq!(&*data, b"hi");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn handles_control_frame_interleaved_between_fragments() {
+        let mut bytes = Vec::new();
+        bytes.extend(frame(false, 0, 1, b"Hel")); // Start(Text)
+        bytes.extend(frame(true, 0, 9, b"pi")); // Ping (control) in the middle
+        bytes.extend(frame(false, 0, 0, b"lo")); // Next
+        bytes.extend(frame(true, 0, 0, b"!")); // End
+        let mut ws = WebSocket::client(&bytes[..]);
+
+        // The interleaved ping surfaces immediately; partial payload stays buffered.
+        match ws.recv_message().await.unwrap() {
+            Event::Ping(data) => assert_eq!(&*data, b"pi"),
+            other => panic!("expected ping, got: {other:?}"),
+        }
+        // The next call resumes reassembly and returns the full message.
+        match ws.recv_message().await.unwrap() {
+            Event::Data { ty, data, .. } => {
+                assert!(matches!(ty, DataType::Complete(MessageType::Text)));
+                assert_eq!(&*data, b"Hello!");
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn reassembles_binary_and_keeps_rsv_of_first_fragment() {
+        let mut bytes = Vec::new();
+        bytes.extend(frame(false, 0b100, 2, &[1, 2])); // Start(Binary), rsv1 set
+        bytes.extend(frame(true, 0, 0, &[3])); // End (rsv here is ignored)
+        let mut ws = WebSocket::client(&bytes[..]);
+        ws.allowed_rsv = 0b100; // RSV1 negotiated (e.g. permessage-deflate)
+
+        match ws.recv_message().await.unwrap() {
+            Event::Data { ty, data, rsv } => {
+                assert!(matches!(ty, DataType::Complete(MessageType::Binary)));
+                assert_eq!(&*data, &[1, 2, 3]);
+                assert_eq!(rsv, 0b100);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn errors_when_reassembled_message_exceeds_limit() {
+        let mut bytes = Vec::new();
+        bytes.extend(frame(false, 0, 2, &[0; 100])); // Start(Binary), within per-frame limit
+        bytes.extend(frame(true, 0, 0, &[0; 100])); // End, pushes the total over the limit
+        let mut ws = WebSocket::client(&bytes[..]);
+        ws.max_payload_len = 150;
+
+        match ws.recv_message().await.unwrap() {
+            Event::Error(msg) => assert_eq!(msg, "fragmented message too large"),
+            other => panic!("expected error, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn rejects_reserved_bit_by_default() {
+        // RSV1 set, but no extension negotiated (allowed_rsv defaults to 0).
+        let bytes = frame(true, 0b100, 1, b"hi");
+        let mut ws = WebSocket::client(&bytes[..]);
+        assert_eq!(ws.allowed_rsv, 0);
+
+        match ws.recv_event().await.unwrap() {
+            Event::Error(msg) => assert_eq!(msg, "reserve bit must be `0`"),
+            other => panic!("expected error, got: {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn accepts_negotiated_rsv_but_still_rejects_others() {
+        let mut bytes = Vec::new();
+        bytes.extend(frame(true, 0b100, 1, b"ok")); // RSV1: allowed once negotiated
+        bytes.extend(frame(true, 0b010, 1, b"no")); // RSV2: still outside the mask
+        let mut ws = WebSocket::client(&bytes[..]);
+        ws.allowed_rsv = 0b100; // permessage-deflate negotiated
+
+        match ws.recv_event().await.unwrap() {
+            Event::Data { data, rsv, .. } => {
+                assert_eq!(&*data, b"ok");
+                assert_eq!(rsv, 0b100);
+            }
+            other => panic!("unexpected event: {other:?}"),
+        }
+        match ws.recv_event().await.unwrap() {
+            Event::Error(msg) => assert_eq!(msg, "reserve bit must be `0`"),
+            other => panic!("expected error, got: {other:?}"),
+        }
+    }
+}
+
 impl<IO> From<(IO, Role)> for WebSocket<IO> {
     #[inline]
     fn from((stream, role): (IO, Role)) -> Self {
         Self {
             stream,
             max_payload_len: 16 * 1024 * 1024,
+            allowed_rsv: 0,
             role,
             is_closed: false,
             fragment: None,
+            msg_buf: Vec::new(),
+            msg_rsv: 0,
         }
     }
 }
